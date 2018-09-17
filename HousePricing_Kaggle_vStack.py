@@ -7,8 +7,10 @@ Created on Fri Sep 14 13:04:08 2018
 """
 
 
-#This program preprocess House features for forecasting their corresponding prices 
-
+#This program makes a prediction for the Kaggle Housing Prices competition.
+#The forecast is made from several house features using different models
+# comparing them with the corresponding stacked ensemble model.
+#
 import os
 import pandas as pd
 import numpy as np
@@ -17,7 +19,7 @@ import seaborn as sns
 import matplotlib.cm as cm
 
 from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import cross_val_score,cross_validate,train_test_split,GridSearchCV
+from sklearn.model_selection import cross_val_score,cross_validate,train_test_split,GridSearchCV, KFold
 from sklearn.preprocessing import MinMaxScaler,StandardScaler
 from sklearn.decomposition import PCA
 
@@ -98,14 +100,14 @@ def SelectingModel(model='Lasso'):
     from sklearn.ensemble import RandomForestRegressor,GradientBoostingRegressor,AdaBoostRegressor
 
     if model=='SVM':
-        Model=SVR()
+        Model=SVR(C=100)
         
-        parameters={'C':[0.1,1,5],'kernel':['linear','rbf']}
+        parameters={'C':[0.5,1,10,30,50,100],'kernel':['rbf']}
     
     if model=='KNR':
-        Model=KNeighborsRegressor()
+        Model=KNeighborsRegressor(n_neighbors=20,weights='distance')
         
-        parameters={'n_neighbors':[3,5,10,50]}
+        parameters={'n_neighbors':[3,5,10,50],'weights':['uniform','distance']}
         
     if model=='Lasso':
         Model=Lasso(alpha=0.001,max_iter=50000)
@@ -188,7 +190,7 @@ def TuningModel(X,Y,Model,parameters,GridSearchFlag=False):
     
     
 #Making a prediction  
-def Forecast(X,Y,X_Test,Model,PrintScoresFlag=False):
+def Forecast(X,Y,X_Test,Model,PrintScoresFlag=False,LogFlag=True):
     
     #print('parameters: {x}'.format(x=Model.get_params()))
 
@@ -199,46 +201,69 @@ def Forecast(X,Y,X_Test,Model,PrintScoresFlag=False):
     Xs=scaler.transform(X)
     X_Test_s=scaler.transform(X_Test)
     
-    Ylog=np.log(Y)
+    if LogFlag:
+        Y=np.log(Y)
     
     if PrintScoresFlag:
-        scores=cross_validate(Model,Xs,Ylog,cv=5,scoring='neg_mean_squared_error',return_train_score=True)
+        scores=cross_validate(Model,Xs,Y,cv=5,scoring='neg_mean_squared_error',return_train_score=True)
         RMSEtrain=np.sqrt(-scores['train_score'])
         RMSEtest=np.sqrt(-scores['test_score'])
         print('Trainset: ',RMSEtrain.mean(),RMSEtrain.std())
         print('Testset: ',RMSEtest.mean(),RMSEtest.std())
     
     
-    Model.fit(Xs,Ylog)
+    Model.fit(Xs,Y)
     
-    Ylog_Forecast=Model.predict(X_Test_s)
-    Y_Forecast=np.exp(Ylog_Forecast)
+    Y_Forecast=Model.predict(X_Test_s)
+    
+    if LogFlag:
+        Y_Forecast=np.exp(Y_Forecast)
     
     return Y_Forecast
 
 
 #Stacking the selected models
-def Stacking(X,Y,X_Test,FinalModel,ModelList,PrintScoresFlag=True):
+def StackedFeatures(X,Y,X_Test,ModelList):
     
-    Ytrain_Forecast=[]
-    Ytest_Forecast=[]
-    for imodel in ModelList:
-        Model,parameters=SelectingModel(model=imodel)
-        Ytrain_Forecast_i=Forecast(X,Y,X,Model)
-        Ytest_Forecast_i=Forecast(X,Y,X_Test,Model)
-        
-        Ytrain_Forecast.append(Ytrain_Forecast_i)
-        Ytest_Forecast.append(Ytest_Forecast_i)
-        
-    Ytrain_Forecast=np.array(Ytrain_Forecast).T
-    Ytest_Forecast=np.array(Ytest_Forecast).T
-        
+    #1 Create empty forecast arrays for train and test dataset for each model
+    Ytrain_Forecast=np.empty([Y.shape[0],len(ModelList)])
+    Ytest_Forecast=np.empty([X_Test.shape[0],len(ModelList)])
     
+    #2 The prediction for the train dataset is done through K folds validation 
+    #to avoid dependency of forecasted Y from corresponding Y values. Training
+    #folds are used to fit_predict testings folds
+    #3 The prediction for the test dataset is done after training the whole 
+    #training dataset for each model
+    kf=KFold(n_splits=5,shuffle=True)
+    for im,imodel in enumerate(ModelList):
+        for itrain,itest in kf.split(X):
+            Xtrain_ik=X[itrain]
+            Ytrain_ik=Y[itrain]
+            
+            Xtest_ik=X[itest]
+            #Ytest_ik=Y[itest]
+        
+        
+            Model,parameters=SelectingModel(model=imodel)
+            Ytest_Forecast_i=Forecast(Xtrain_ik,Ytrain_ik,Xtest_ik,Model)
+            
+            Ytrain_Forecast[itest,im]=Ytest_Forecast_i
+        
+        Ytest_Forecast[:,im]=Forecast(X,Y,X_Test,Model)
+    
+    #4 Forecasted Ys from different models are used as new features to predict Y
+    #    This part is done by the StackedForecast function
+   
+    return Ytrain_Forecast,Ytest_Forecast
+
+#Forecast from the forecasted features
+def StackedForecast(Ytrain_Forecast,Y,Ytest_Forecast,FinalModel,PrintScoresFlag=True):
+
     Model,parameters=SelectingModel(model=FinalModel)
+    
     Y_Forecast_Stack=Forecast(Ytrain_Forecast,Y,Ytest_Forecast,Model,PrintScoresFlag)
     
     return Y_Forecast_Stack
-
 
 
 #RUNNING ALL THE SEQUENCE
@@ -248,7 +273,6 @@ X,Y,X_Test=Preprocessing()
 Model,parameters=SelectingModel(model='SVM')
 TuningModel(X,Y,Model,parameters,GridSearchFlag=True)
 Y_Forecast=Forecast(X,Y,X_Test,Model,PrintScoresFlag=True)
-
 #Printing the output
 df_Forecast = pd.DataFrame(Y_Forecast, index=dftest0.Id, columns=['SalePrice'])
 #df_Forecast.to_csv('output_vGradientBoosting_simple.csv', header=True, index_label='Id')
@@ -256,8 +280,14 @@ df_Forecast = pd.DataFrame(Y_Forecast, index=dftest0.Id, columns=['SalePrice'])
 
 #Creating a stacked ensemble from different models
 ModelList=['KNR','SVM','Lasso','RandomForest','GradientBoosting','AdaBoost']
-Y_Forecast_Stack=Stacking(X,Y,X_Test,'RandomForest',ModelList,PrintScoresFlag=True)
+Ytrain_Forecast,Ytest_Forecast = StackedFeatures(X,Y,X_Test,ModelList)
+
+Model,parameters=SelectingModel(model='KNR')
+TuningModel(Ytrain_Forecast,Y,Model,parameters,GridSearchFlag=True)
+
+Y_Forecast_Stack=StackedForecast(Ytrain_Forecast,Y,Ytest_Forecast,'KNR',PrintScoresFlag=True)
 
 #Printing the output
 df_Forecast_Stack = pd.DataFrame(Y_Forecast_Stack, index=dftest0.Id, columns=['SalePrice'])
 df_Forecast_Stack.to_csv('output_vStack_simple.csv', header=True, index_label='Id')
+
